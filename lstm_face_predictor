@@ -1,0 +1,690 @@
+{
+  "nbformat": 4,
+  "nbformat_minor": 0,
+  "metadata": {
+    "colab": {
+      "provenance": [],
+      "authorship_tag": "ABX9TyNO31qkpmC8HarQ4XQWCV5H",
+      "include_colab_link": true
+    },
+    "kernelspec": {
+      "name": "python3",
+      "display_name": "Python 3"
+    },
+    "language_info": {
+      "name": "python"
+    }
+  },
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "view-in-github",
+        "colab_type": "text"
+      },
+      "source": [
+        "<a href=\"https://colab.research.google.com/github/wannes243/CubeSat-Thermal-Prediction/blob/main/lstm_face_predictor\" target=\"_parent\"><img src=\"https://colab.research.google.com/assets/colab-badge.svg\" alt=\"Open In Colab\"/></a>"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "Pe_AFT6QVirY"
+      },
+      "outputs": [],
+      "source": [
+        "# ============================================================\n",
+        "# generate_and_train_lstm.py\n",
+        "# ============================================================\n",
+        "# Goal:\n",
+        "# - Generate a synthetic CubeSat thermal telemetry dataset (6 faces)\n",
+        "# - Build a supervised learning task: predict temperature at t+5 minutes\n",
+        "# - Train an LSTM regression model to forecast future temperatures\n",
+        "# ============================================================"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "#  IMPORTS\n",
+        "import math  # used for periodic functions (cos/sin) and pi\n",
+        "import datetime  # used to generate timestamps\n",
+        "import numpy as np  # numeric arrays + random noise\n",
+        "import pandas as pd  # tabular dataset + shifting targets + CSV export\n",
+        "\n",
+        "import torch  # deep learning tensors + GPU support if available\n",
+        "import torch.nn as nn  # neural network modules (LSTM, Linear, losses)\n",
+        "\n",
+        "from tqdm import tqdm  # progress bar for long simulation loop\n",
+        "from sklearn.preprocessing import StandardScaler  # feature scaling (standardization)\n",
+        "from sklearn.metrics import mean_absolute_error, mean_squared_error  # evaluation metrics (MAE, RMSE)\n"
+      ],
+      "metadata": {
+        "id": "CEPni-USVl-B"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# GLOBAL PARAMETERS\n",
+        "YEARS = 1  # number of simulated years\n",
+        "timestep_minutes = 1  # sampling resolution in minutes (1 sample per minute)\n",
+        "\n",
+        "# Total timesteps = minutes per year * number of years / sampling step\n",
+        "# 365 days/year * 24 hours/day * 60 minutes/hour = 525,600 minutes/year\n",
+        "TIMESTEPS = int(365 * 24 * 60 / timestep_minutes * YEARS)\n",
+        "\n",
+        "ORBIT_PERIOD_MIN = 90  # orbital period (minutes), simplified LEO value\n",
+        "SUNLIT_DURATION_MIN = 60  # minutes in sun per orbit, simplified eclipse model\n",
+        "\n",
+        "SENSOR_NOISE_STD_TEMP = 0.25  # measurement noise for temperature (°C)\n",
+        "SENSOR_NOISE_STD_AMP = 2.0  # measurement noise for currents (mA)\n",
+        "\n",
+        "RNG_SEED = 42  # random seed for reproducibility\n",
+        "\n",
+        "# --- Simple thermal dynamics constants (toy model) ---\n",
+        "HEATING_RATE_SUN = 0.08  # °C/min when a face receives full solar incidence (coefficient)\n",
+        "COOLING_RATE_FACTOR = 0.0015  # proportional cooling factor (toy approximation)\n",
+        "INTERNAL_HEAT_BASE = 0.02  # °C/min baseline internal dissipation\n",
+        "RADIO_HEAT_ADDITION = 0.4  # °C/min added dissipation when radio is ON\n",
+        "\n",
+        "# --- Simple power / telemetry constants (toy model) ---\n",
+        "SOLAR_CURRENT_FULL = 150.0  # mA per \"fully illuminated face coefficient sum\"\n",
+        "BATTERY_BASE_DRAW = 45.0  # mA baseline consumption\n",
+        "RADIO_DRAW = 100.0  # mA extra draw when radio is ON\n",
+        "\n",
+        "# Output path for the synthetic dataset\n",
+        "OUTPUT_CSV = \"synthetic_cubesat_1year.csv\"\n",
+        "\n",
+        "# Choose compute device for training (GPU if available, else CPU)\n",
+        "DEVICE = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")"
+      ],
+      "metadata": {
+        "id": "F_NwEJ19VmFk"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# REPRODUCIBILITY (seeds)\n",
+        "np.random.seed(RNG_SEED)  # ensures same synthetic noise/data each run\n",
+        "torch.manual_seed(RNG_SEED)  # ensures same model init / torch randomness\n",
+        "if torch.cuda.is_available():  # if GPU is used, also seed CUDA\n",
+        "    torch.cuda.manual_seed_all(RNG_SEED)  # seed all GPUs (if any)"
+      ],
+      "metadata": {
+        "id": "D5JLgf5RVmKg"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# TIME AXIS (timestamps)\n",
+        "\n",
+        "start = datetime.datetime(2025, 1, 1, 0, 0, 0)  # simulation start timestamp\n",
+        "timestamps = [  # build timestamp list of length TIMESTEPS\n",
+        "    start + datetime.timedelta(minutes=i * timestep_minutes)\n",
+        "    for i in range(TIMESTEPS)\n",
+        "]"
+      ],
+      "metadata": {
+        "id": "MnLEMExZVmOI"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# AUXILIARY FUNCTIONS\n",
+        "\n",
+        "def orbital_phase_minute(idx: int) -> int:\n",
+        "    # Purpose: convert global time index into minute-within-orbit\n",
+        "    # Example: ORBIT_PERIOD_MIN=90 => values cycle in [0..89]\n",
+        "    return (idx * timestep_minutes) % ORBIT_PERIOD_MIN\n",
+        "\n",
+        "\n",
+        "def in_sun(orbit_min: int) -> bool:\n",
+        "    # Purpose: eclipse model (simplified)\n",
+        "    # Assumption: spacecraft is sunlit during the first SUNLIT_DURATION_MIN of each orbit\n",
+        "    return 0 <= orbit_min < SUNLIT_DURATION_MIN\n",
+        "\n",
+        "\n",
+        "def face_incidence(orbit_min: int, face_index: int, attitude_offset: float = 0.0) -> float:\n",
+        "    # Purpose: compute a coefficient in [0,1] indicating solar flux fraction on a face\n",
+        "    # - 0.0 means no illumination (face away from sun or shadow)\n",
+        "    # - 1.0 means maximum illumination (face aligned with sun direction)\n",
+        "    # Model: cosine-based incidence (toy geometry)\n",
+        "    base_phase = (face_index / 6.0) * 2 * math.pi  # assign each face an angular direction\n",
+        "    orb_phase = (orbit_min / ORBIT_PERIOD_MIN) * 2 * math.pi  # orbit time mapped to [0..2π]\n",
+        "    val = math.cos(orb_phase - base_phase - attitude_offset)  # alignment ~ cos(angle difference)\n",
+        "    return max(0.0, val)  # clamp negatives: no \"negative sunlight\""
+      ],
+      "metadata": {
+        "id": "HXD5ZtPmVmQ4"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# SIMULATION STATE (thermal + attitude)\n",
+        "\n",
+        "temps = np.full(6, 20.0)  # initialize 6 face temperatures (°C)\n",
+        "\n",
+        "# Attitude drift: slow change to avoid identical illumination patterns each orbit\n",
+        "# Here: 1 full revolution (2π rad) every 7 days\n",
+        "attitude_rate = 2 * math.pi / (24 * 60 * 7)  # radians per minute\n",
+        "attitude = 0.0  # initial orientation angle (radians)\n",
+        "\n",
+        "rows = []  # we store each timestep as a row dict, later convert to DataFrame\n"
+      ],
+      "metadata": {
+        "id": "_e7DOLicWaFE"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "#  SYNTHETIC DATA GENERATION LOOP\n",
+        "\n",
+        "print(\"Generating synthetic dataset (may take time for 1-year at 1-min resolution)...\")\n",
+        "\n",
+        "for idx in tqdm(range(TIMESTEPS)):  # iterate over each minute\n",
+        "    orb_min = orbital_phase_minute(idx)  # minute-within-orbit (0..89)\n",
+        "    sun_flag = 1 if in_sun(orb_min) else 0  # convert bool to {0,1} for ML features\n",
+        "\n",
+        "    # Radio schedule (toy): radio transmits during minutes (1..9) of each orbit\n",
+        "    radio_on = 1 if 0 < orb_min < 10 else 0\n",
+        "\n",
+        "    # Update attitude slowly (toy drift)\n",
+        "    attitude += attitude_rate * timestep_minutes  # increment angle by rate * dt\n",
+        "    if attitude > 2 * math.pi:  # keep angle bounded\n",
+        "        attitude -= 2 * math.pi\n",
+        "\n",
+        "    # Solar incidence coefficient per face (0..1)\n",
+        "    incidences = np.array([face_incidence(orb_min, f, attitude) for f in range(6)])\n",
+        "\n",
+        "    # If spacecraft in eclipse, no solar incidence on any face\n",
+        "    if not sun_flag:\n",
+        "        incidences[:] = 0.0\n",
+        "\n",
+        "    # Solar heating contribution per face (°C/min)\n",
+        "    solar_inputs = incidences * HEATING_RATE_SUN\n",
+        "\n",
+        "    # Internal heating per face (°C/min), baseline plus occasional events\n",
+        "    internal_heats = np.full(6, INTERNAL_HEAT_BASE)\n",
+        "\n",
+        "    # Occasional electronics activity on some faces (toy bursts)\n",
+        "    if idx % (ORBIT_PERIOD_MIN * 20) < 5:  # burst pattern on face 0\n",
+        "        internal_heats[0] += 0.05\n",
+        "    if idx % (ORBIT_PERIOD_MIN * 15) < 7:  # burst pattern on face 1\n",
+        "        internal_heats[1] += 0.03\n",
+        "\n",
+        "    # Add radio heating on one face (toy mapping: face 2)\n",
+        "    if radio_on:\n",
+        "        internal_heats[2] += RADIO_HEAT_ADDITION\n",
+        "\n",
+        "    # Cooling losses (toy): proportional to current temperature\n",
+        "    # Interpretation: hotter surfaces radiate more and thus lose more heat\n",
+        "    heat_out = COOLING_RATE_FACTOR * temps\n",
+        "\n",
+        "    # Euler integration step (Temp_{t+1} = Temp_t + (inputs - outputs))\n",
+        "    delta_temps = solar_inputs + internal_heats - heat_out\n",
+        "    temps = temps + delta_temps\n",
+        "\n",
+        "    # Add sensor measurement noise (what we store is \"measured\" temp, not perfect true temp)\n",
+        "    measured_temps = temps + np.random.normal(0, SENSOR_NOISE_STD_TEMP, size=6)\n",
+        "\n",
+        "    # System-level currents (toy telemetry)\n",
+        "    solar_current = (np.sum(incidences) * SOLAR_CURRENT_FULL) + np.random.normal(0, SENSOR_NOISE_STD_AMP)\n",
+        "    battery_draw = (BATTERY_BASE_DRAW + radio_on * RADIO_DRAW) + np.random.normal(0, SENSOR_NOISE_STD_AMP)\n",
+        "\n",
+        "    # Distance (toy): small periodic variation around 700 km\n",
+        "    distance_km = 700 + 10 * math.sin(2 * math.pi * idx / (ORBIT_PERIOD_MIN * 10))\n",
+        "\n",
+        "    # Build one telemetry row (one minute)\n",
+        "    row = {\n",
+        "        \"timestamp\": timestamps[idx].isoformat(),  # ISO timestamp string\n",
+        "        \"orbital_minute\": orb_min,  # minute in orbit\n",
+        "        \"is_sunlit\": sun_flag,  # 0/1 sunlight state\n",
+        "        \"radio_on\": radio_on,  # 0/1 operational mode\n",
+        "        \"solar_current_mA\": solar_current,  # solar current telemetry\n",
+        "        \"battery_draw_mA\": battery_draw,  # load telemetry\n",
+        "        \"distance_km\": distance_km,  # orbital distance proxy\n",
+        "    }\n",
+        "\n",
+        "    # Store face temperatures as separate columns\n",
+        "    for f in range(6):\n",
+        "        row[f\"temp_face_{f+1}\"] = measured_temps[f]\n",
+        "\n",
+        "    rows.append(row)  # append row to dataset list"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "v128q_TOWaO7",
+        "outputId": "be6d5b2c-f2a2-4fec-b3d2-5e0e50d00f08"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "Generating synthetic dataset (may take time for 1-year at 1-min resolution)...\n"
+          ]
+        },
+        {
+          "output_type": "stream",
+          "name": "stderr",
+          "text": [
+            "100%|██████████| 525600/525600 [00:38<00:00, 13665.21it/s]\n"
+          ]
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "#  BUILD DATAFRAME + CREATE TARGETS (t+5 minutes)\n",
+        "# -----------------------------\n",
+        "df = pd.DataFrame(rows)  # convert list-of-dicts to tabular dataset\n",
+        "\n",
+        "shift_steps = int(5 / timestep_minutes)  # number of steps corresponding to 5 minutes\n",
+        "\n",
+        "# Target definition: for each face, predict temperature 5 minutes into the future\n",
+        "for f in range(6):\n",
+        "    df[f\"target_face_{f+1}_t+5\"] = df[f\"temp_face_{f+1}\"].shift(-shift_steps)\n",
+        "\n",
+        "# Remove last rows that do not have future targets (NaNs due to shift)\n",
+        "df = df.iloc[:-shift_steps].reset_index(drop=True)\n",
+        "\n",
+        "# Save the dataset to disk (useful for reuse and for jury validation)\n",
+        "df.to_csv(OUTPUT_CSV, index=False)\n",
+        "\n",
+        "print(f\"\\nDataset saved: {OUTPUT_CSV}\")\n",
+        "print(f\"Rows: {len(df)} | Columns: {len(df.columns)}\")"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "ov118fOSWaR0",
+        "outputId": "0fbaf37e-50b9-44a7-9b1a-c4a1d17639f6"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "\n",
+            "Dataset saved: synthetic_cubesat_1year.csv\n",
+            "Rows: 525595 | Columns: 19\n"
+          ]
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        " # PREPARE DATA FOR LSTM (features, targets, sequences)\n",
+        "\n",
+        "print(\"\\nPreparing data for LSTM...\")\n",
+        "\n",
+        "# Input features per timestep (telemetry + current temperatures)\n",
+        "feature_cols = (\n",
+        "    [\"is_sunlit\", \"radio_on\", \"solar_current_mA\", \"battery_draw_mA\", \"distance_km\"]\n",
+        "    + [f\"temp_face_{i+1}\" for i in range(6)]\n",
+        ")\n",
+        "\n",
+        "# Output targets (future temperatures at t+5)\n",
+        "target_cols = [f\"target_face_{i+1}_t+5\" for i in range(6)]\n",
+        "\n",
+        "# Extract raw matrices\n",
+        "X_raw = df[feature_cols].values  # shape: (N, n_features)\n",
+        "y_raw = df[target_cols].values  # shape: (N, 6)\n",
+        "\n",
+        "# Define sequence length (how many past minutes the LSTM sees)\n",
+        "seq_len = 10  # use the last 10 minutes as input context\n",
+        "\n",
+        "# Build sequences: X_seq[k] is a window [t-seq_len ... t-1], y_seq[k] is target at time t\n",
+        "X_seq = []\n",
+        "y_seq = []\n",
+        "N = len(df)\n",
+        "\n",
+        "for i in range(seq_len, N):  # start at seq_len so we have enough past\n",
+        "    X_seq.append(X_raw[i - seq_len : i, :])  # window of length seq_len\n",
+        "    y_seq.append(y_raw[i, :])  # aligned target at time i (already t+5 shifted)\n",
+        "\n",
+        "X_seq = np.stack(X_seq)  # shape: (samples, seq_len, n_features)\n",
+        "y_seq = np.stack(y_seq)  # shape: (samples, 6)\n",
+        "\n",
+        "# Chronological train/test split (time series best practice)\n",
+        "train_ratio = 0.8\n",
+        "train_n = int(len(X_seq) * train_ratio)\n",
+        "\n",
+        "X_train = X_seq[:train_n]\n",
+        "X_test = X_seq[train_n:]\n",
+        "y_train = y_seq[:train_n]\n",
+        "y_test = y_seq[train_n:]\n",
+        "\n",
+        "# Feature scaling:\n",
+        "# - We scale using training data statistics only (to avoid leaking test information)\n",
+        "# - StandardScaler expects 2D arrays, so we reshape (samples*seq_len, features)\n",
+        "scaler_X = StandardScaler()\n",
+        "\n",
+        "X_train_2d = X_train.reshape(-1, X_train.shape[2])  # flatten time dimension for scaler fit\n",
+        "X_test_2d = X_test.reshape(-1, X_test.shape[2])  # flatten for transform\n",
+        "\n",
+        "X_train_scaled = scaler_X.fit_transform(X_train_2d).reshape(X_train.shape)  # restore 3D\n",
+        "X_test_scaled = scaler_X.transform(X_test_2d).reshape(X_test.shape)  # restore 3D\n",
+        "\n",
+        "# Convert numpy arrays to torch tensors and move to DEVICE\n",
+        "X_train_t = torch.tensor(X_train_scaled, dtype=torch.float32, device=DEVICE)\n",
+        "X_test_t = torch.tensor(X_test_scaled, dtype=torch.float32, device=DEVICE)\n",
+        "y_train_t = torch.tensor(y_train, dtype=torch.float32, device=DEVICE)\n",
+        "y_test_t = torch.tensor(y_test, dtype=torch.float32, device=DEVICE)\n",
+        "\n",
+        "print(\n",
+        "    f\"Train samples: {len(X_train_t)} | Test samples: {len(X_test_t)} | \"\n",
+        "    f\"seq_len: {seq_len} | n_features: {X_train_t.shape[2]} | device: {DEVICE}\"\n",
+        ")\n"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "SUODgAP_Xz6e",
+        "outputId": "4d83dbe0-0db5-40bd-ca8a-8dc53805e4c4"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "\n",
+            "Preparing data for LSTM...\n",
+            "Train samples: 420468 | Test samples: 105117 | seq_len: 10 | n_features: 11 | device: cpu\n"
+          ]
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# DEFINE LSTM MODEL (multi-output regression)\n",
+        "class LSTMTempModel(nn.Module):\n",
+        "    # Purpose: map a sequence of telemetry windows to future face temperatures (6 outputs)\n",
+        "    def __init__(self, input_size: int, hidden_size: int = 32, num_layers: int = 1, output_size: int = 6):\n",
+        "        super().__init__()  # initialize nn.Module base class\n",
+        "\n",
+        "        # LSTM layer:\n",
+        "        # - input: (batch, seq_len, input_size)\n",
+        "        # - output: (batch, seq_len, hidden_size)\n",
+        "        self.lstm = nn.LSTM(\n",
+        "            input_size=input_size,\n",
+        "            hidden_size=hidden_size,\n",
+        "            num_layers=num_layers,\n",
+        "            batch_first=True,\n",
+        "        )\n",
+        "\n",
+        "        # Linear head:\n",
+        "        # - takes last hidden state and outputs 6 predicted temperatures\n",
+        "        self.fc = nn.Linear(hidden_size, output_size)\n",
+        "\n",
+        "    def forward(self, x: torch.Tensor) -> torch.Tensor:\n",
+        "        # x shape: (batch, seq_len, features)\n",
+        "        out, _ = self.lstm(x)  # out shape: (batch, seq_len, hidden_size)\n",
+        "        last = out[:, -1, :]  # take last time step representation (batch, hidden_size)\n",
+        "        y_hat = self.fc(last)  # (batch, 6)\n",
+        "        return y_hat\n",
+        "\n",
+        "\n",
+        "# Instantiate model using feature dimension from training data\n",
+        "input_size = X_train_t.shape[2]\n",
+        "model = LSTMTempModel(input_size=input_size, hidden_size=32, num_layers=1, output_size=6).to(DEVICE)"
+      ],
+      "metadata": {
+        "id": "2Orzb1r2X0BV"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# TRAINING SETUP\n",
+        "\n",
+        "epochs = 5  # number of passes over the training data\n",
+        "batch_size = 2048  # batch size (large batches can speed training on GPU)\n",
+        "optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)  # Adam optimizer\n",
+        "loss_fn = nn.L1Loss()  # MAE loss (robust to outliers vs MSE)\n",
+        "\n",
+        "\n",
+        "def get_batches(X: torch.Tensor, y: torch.Tensor, batch_size: int):\n",
+        "    # Purpose: simple batching generator (like a lightweight DataLoader)\n",
+        "    n = len(X)\n",
+        "    for i in range(0, n, batch_size):\n",
+        "        yield X[i : i + batch_size], y[i : i + batch_size]"
+      ],
+      "metadata": {
+        "id": "RSAwTbByX0Dt"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# TRAINING LOOP + EVALUATION\n",
+        "\n",
+        "print(\"\\nTraining LSTM...\")\n",
+        "\n",
+        "for epoch in range(1, epochs + 1):\n",
+        "    model.train()  # set model to training mode\n",
+        "\n",
+        "    train_losses = []\n",
+        "\n",
+        "    for bx, by in get_batches(X_train_t, y_train_t, batch_size):\n",
+        "        optimizer.zero_grad()  # clear old gradients\n",
+        "        preds = model(bx)  # forward pass\n",
+        "        loss = loss_fn(preds, by)  # compute MAE loss\n",
+        "        loss.backward()  # backprop gradients\n",
+        "        optimizer.step()  # update weights\n",
+        "        train_losses.append(loss.item())  # store loss for monitoring\n",
+        "\n",
+        "    # Evaluation on test set (no gradient computation)\n",
+        "    model.eval()  # set model to evaluation mode\n",
+        "    with torch.no_grad():\n",
+        "        test_preds = model(X_test_t).cpu().numpy()  # move to CPU for sklearn metrics\n",
+        "        test_true = y_test_t.cpu().numpy()\n",
+        "\n",
+        "        test_mae = mean_absolute_error(test_true, test_preds)  # MAE across all outputs\n",
+        "        test_rmse = math.sqrt(mean_squared_error(test_true, test_preds))  # RMSE\n",
+        "\n",
+        "    print(\n",
+        "        f\"Epoch {epoch}/{epochs} | \"\n",
+        "        f\"Train loss (MAE): {np.mean(train_losses):.4f} | \"\n",
+        "        f\"Test MAE: {test_mae:.4f} | Test RMSE: {test_rmse:.4f}\"\n",
+        "    )\n"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "GsGynVkQX0F2",
+        "outputId": "651b0ddc-5a2a-4931-badf-72bfb6997b92"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "\n",
+            "Training LSTM...\n",
+            "Epoch 1/5 | Train loss (MAE): 25.3964 | Test MAE: 20.2617 | Test RMSE: 23.1633\n",
+            "Epoch 2/5 | Train loss (MAE): 16.2262 | Test MAE: 12.4273 | Test RMSE: 16.7047\n",
+            "Epoch 3/5 | Train loss (MAE): 10.3617 | Test MAE: 8.9382 | Test RMSE: 12.6692\n",
+            "Epoch 4/5 | Train loss (MAE): 7.9857 | Test MAE: 7.2138 | Test RMSE: 9.7520\n",
+            "Epoch 5/5 | Train loss (MAE): 6.5058 | Test MAE: 5.9076 | Test RMSE: 7.3762\n"
+          ]
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# SAMPLE PREDICTION DISPLAY\n",
+        "print(\"\\nTraining complete. Example prediction on first test sample:\")\n",
+        "\n",
+        "model.eval()\n",
+        "with torch.no_grad():\n",
+        "    sample_pred = model(X_test_t[:1]).cpu().numpy()[0]  # predicted 6 temps\n",
+        "    sample_true = y_test_t[:1].cpu().numpy()[0]  # true 6 temps\n",
+        "\n",
+        "print(\"Pred (t+5):\", sample_pred)\n",
+        "print(\"True (t+5):\", sample_true)"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "2MICrl2cYBFv",
+        "outputId": "13269da1-ee2a-4025-d36d-6516cac4dd7d"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "\n",
+            "Training complete. Example prediction on first test sample:\n",
+            "Pred (t+5): [24.76534  24.873817 37.971077 24.665112 24.61926  24.593702]\n",
+            "True (t+5): [22.306814 16.890177 47.62383  27.504616 30.280912 28.988287]\n"
+          ]
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "import numpy as np\n",
+        "\n",
+        "delta = 10 # tolérance en °C\n",
+        "acc_delta = np.mean(np.abs(test_true - test_preds) <= delta) * 100\n",
+        "print(f\"Accuracy (±{delta}°C): {acc_delta:.2f}%\")"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "LetfPvMqaGc3",
+        "outputId": "5f33d9de-df1d-4064-989d-eb1b1bdfe22d"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "Accuracy (±10°C): 88.28%\n"
+          ]
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "import torch\n",
+        "import joblib\n",
+        "\n",
+        "# Sauvegarder le modèle (poids)\n",
+        "torch.save({\n",
+        "    \"model_state_dict\": model.state_dict(),\n",
+        "    \"model_config\": {\n",
+        "        \"input_size\": input_size,\n",
+        "        \"hidden_size\": 32,\n",
+        "        \"num_layers\": 1,\n",
+        "        \"output_size\": 6\n",
+        "    },\n",
+        "    \"seq_len\": seq_len,\n",
+        "    \"feature_cols\": feature_cols\n",
+        "}, \"cubesat_lstm.pt\")\n",
+        "\n",
+        "# Sauvegarder le scaler (standardisation)\n",
+        "joblib.dump(scaler_X, \"scaler_X.pkl\")\n",
+        "\n",
+        "print(\"Saved: cubesat_lstm.pt and scaler_X.pkl\")"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "NZcAmzoKkLKn",
+        "outputId": "5873d447-295e-4f0d-9e08-999b05870d9f"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "Saved: cubesat_lstm.pt and scaler_X.pkl\n"
+          ]
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "from google.colab import drive\n",
+        "drive.mount('/content/drive')\n"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "qfemnpTYxO6W",
+        "outputId": "b43a7ab9-72a7-4ab5-887f-bd3a3524ae73"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "Mounted at /content/drive\n"
+          ]
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "!cp cubesat_lstm.pt /content/drive/MyDrive/\n",
+        "!cp scaler_X.pkl /content/drive/MyDrive/"
+      ],
+      "metadata": {
+        "id": "VvXW9loDxQL6"
+      },
+      "execution_count": null,
+      "outputs": []
+    }
+  ]
+}
